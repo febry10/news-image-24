@@ -1,62 +1,78 @@
-// Entry point for "The World Today" — Tuesday 24 November 2026.
+// "The World Today" — Tuesday 24 November 2026: entry program.
 //
-// The scored artefact is a single PNG image, not a running service.
-// So this program does three things, in order:
-//   1. validate the bundled poster.png against every hard limit
-//      (real PNG, exactly 1024x1024, at most 1 MiB, properly closed);
-//   2. copy those bytes unchanged to $MAKEFUN_OUTPUT_DIR/entry.png
-//      (falling back to /output when the variable is unset);
-//   3. read the copy back and compare SHA-256 digests, so a partial
-//      or altered write can never slip through silently.
-// It prints exactly one summary line and exits 0 on success. There
-// are no timestamps and no random inputs anywhere below, which is
-// what makes repeated runs byte-for-byte deterministic. The poster
-// itself is rendered from poster.html (headless Chromium, 1024x1024)
-// and committed as poster.png; this file only validates and copies it.
+// This repository ships a finished front page, not a service. The
+// page lives in poster.png (typeset in poster.html, rendered once
+// with headless Chromium at 1024x1024) and the grader expects those
+// exact bytes at entry.png inside the output directory. So the job
+// here is deliberately small and strict:
+//
+//   * prove poster.png is a complete, legal PNG of 1024x1024 that
+//     fits the one-megabyte ceiling;
+//   * copy it to the output directory under the name entry.png;
+//   * re-read the copy and prove, byte for byte and by digest, that
+//     what landed on disk is what the repository holds.
+//
+// Nothing below reads a clock, a random source or the network, so
+// two runs always agree. Only the Node.js standard library is used.
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { copyFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const posterPath = join(here, "poster.png");
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
-const outPath = join(outDir, "entry.png");
+const root = dirname(fileURLToPath(import.meta.url));
+const sourcePath = join(root, "poster.png");
+const targetDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
+const targetPath = join(targetDir, "entry.png");
 
-const LIMIT = 1048576;
-const W = 1024;
-const H = 1024;
-const SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+const MAX_BYTES = 1_048_576;
+const EXPECTED = { width: 1024, height: 1024 };
+const PNG_MAGIC = [137, 80, 78, 71, 13, 10, 26, 10];
 
-function die(msg: string): never {
-  throw new Error(msg);
+function fail(reason: string): never {
+  throw new Error(`poster rejected: ${reason}`);
 }
 
-function check(data: Buffer): void {
-  // An empty file would also fail the signature test, but naming the
-  // actual problem makes a broken render much faster to diagnose.
-  if (data.length === 0) die("poster.png is empty");
-  if (data.length > LIMIT) die(`too large: ${data.length} > ${LIMIT}`);
-  if (data.length < 33) die("file too short for a PNG");
-  if (!data.subarray(0, 8).equals(SIG)) die("bad PNG signature");
-  if (data.toString("latin1", 12, 16) !== "IHDR") die("missing IHDR");
-  if (data.readUInt32BE(16) !== W || data.readUInt32BE(20) !== H) {
-    die(`dimensions ${data.readUInt32BE(16)}x${data.readUInt32BE(20)} != 1024x1024`);
+function pngSize(buf: Buffer): { width: number; height: number } {
+  const magicOk = PNG_MAGIC.every((byte, i) => buf[i] === byte);
+  if (!magicOk) fail("the eight-byte PNG signature is missing");
+  if (buf.toString("latin1", 12, 16) !== "IHDR") {
+    fail("the first chunk is not IHDR");
   }
-  if (data.toString("latin1", data.length - 8, data.length - 4) !== "IEND") {
-    die("missing IEND trailer");
-  }
+  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
 }
 
-function digest(buf: Buffer): string {
-  return createHash("sha256").update(buf).digest("hex");
+function sha256(buf: Buffer): string {
+  const hash = createHash("sha256");
+  hash.update(buf);
+  return hash.digest("hex");
 }
 
-const data = readFileSync(posterPath);
-check(data);
-if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
-copyFileSync(posterPath, outPath);
-const back = readFileSync(outPath);
-if (digest(back) !== digest(data)) die("entry.png differs from poster.png");
-console.log(`entry.png OK: ${data.length} bytes, 1024x1024, sha256 ${digest(data).slice(0, 16)}…`);
+const poster = readFileSync(sourcePath);
+if (poster.byteLength === 0) fail("poster.png is an empty file");
+if (poster.byteLength > MAX_BYTES) {
+  fail(`poster.png is ${poster.byteLength} bytes, over the ${MAX_BYTES} cap`);
+}
+const size = pngSize(poster);
+if (size.width !== EXPECTED.width || size.height !== EXPECTED.height) {
+  fail(`canvas is ${size.width}x${size.height}, not 1024x1024`);
+}
+const trailer = poster.toString("latin1", poster.byteLength - 8, poster.byteLength - 4);
+if (trailer !== "IEND") fail("the IEND trailer is missing, file looks cut short");
+
+function verifyCopy(path: string, original: Buffer): number {
+  // A copy is only trusted once it has been read back and matched
+  // twice over: byte equality first, then the SHA-256 digest, so a
+  // truncated or silently altered write can never pass as the page.
+  const back = readFileSync(path);
+  if (!back.equals(original)) fail("entry.png on disk differs from poster.png");
+  if (sha256(back) !== sha256(original)) fail("digest mismatch after copying");
+  return statSync(path).size;
+}
+
+mkdirSync(targetDir, { recursive: true });
+copyFileSync(sourcePath, targetPath);
+const onDisk = verifyCopy(targetPath, poster);
+console.log(
+  `entry.png delivered: ${onDisk} bytes, ${size.width}x${size.height}, sha256 ${sha256(poster)}`,
+);
